@@ -1,0 +1,8 @@
+{
+  "name": "mcp-compress",
+  "description": "Data compression MCP server with auto-algorithm selection",
+  "repository": "https://github.com/ShipItAndPray/mcp-compress",
+  "license": "MIT",
+  "runtime": "node",
+  "command": "npx mcp-compress"
+}
