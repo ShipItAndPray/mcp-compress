@@ -6,6 +6,8 @@ The first MCP server for data compression. Gives any AI agent the ability to com
 
 Zero dependencies. Pure Node.js. Lossless round-trip. Auto-picks the best algorithm.
 
+[![mcp-compress MCP server](https://glama.ai/mcp/servers/ShipItAndPray/mcp-compress/badges/card.svg)](https://glama.ai/mcp/servers/ShipItAndPray/mcp-compress)
+
 ## Benchmarks
 
 Real results on real data types:
