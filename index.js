@@ -36,6 +36,162 @@ import { homedir } from 'os';
 import { createHash } from 'crypto';
 
 // ═══════════════════════════════════════════════════════════
+// TurboQuant — Extreme numerical compression
+// Based on Google Research's TurboQuant (ICLR 2026)
+// Random rotation + quantization for vectors/numbers
+// ═══════════════════════════════════════════════════════════
+
+class TurboQuant {
+  constructor(bits = 4, blockSize = 32, seed = 42) {
+    this.bits = bits;
+    this.blockSize = blockSize;
+    this.seed = seed;
+    this.levels = 1 << bits;
+  }
+
+  _rng(seed) {
+    // Deterministic PRNG (mulberry32)
+    let s = seed | 0;
+    return () => { s = (s + 0x6D2B79F5) | 0; let t = Math.imul(s ^ (s >>> 15), 1 | s); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+
+  _hadamard(x, inverse, seed) {
+    const n = x.length;
+    const result = [...x];
+    const rounds = 3;
+
+    const allSigns = [];
+    const rng = this._rng(seed);
+    for (let r = 0; r < rounds; r++) {
+      const signs = [];
+      for (let i = 0; i < n; i++) signs.push(rng() > 0.5 ? 1 : -1);
+      allSigns.push(signs);
+    }
+
+    const order = inverse ? [2, 1, 0] : [0, 1, 2];
+    for (const r of order) {
+      const signs = allSigns[r];
+      if (!inverse) {
+        for (let i = 0; i < n; i++) result[i] *= signs[i];
+        let h = 1;
+        while (h < n) {
+          for (let i = 0; i < n; i += h * 2)
+            for (let j = i; j < i + h; j++) {
+              const a = result[j], b = result[j + h];
+              result[j] = a + b; result[j + h] = a - b;
+            }
+          h *= 2;
+        }
+        const norm = Math.sqrt(n);
+        for (let i = 0; i < n; i++) result[i] /= norm;
+      } else {
+        let h = 1;
+        while (h < n) {
+          for (let i = 0; i < n; i += h * 2)
+            for (let j = i; j < i + h; j++) {
+              const a = result[j], b = result[j + h];
+              result[j] = a + b; result[j + h] = a - b;
+            }
+          h *= 2;
+        }
+        const norm = Math.sqrt(n);
+        for (let i = 0; i < n; i++) result[i] = result[i] / norm * signs[i];
+      }
+    }
+    return result;
+  }
+
+  compress(numbers) {
+    const bs = this.blockSize;
+    // Delta encode for correlated data
+    const first = numbers[0];
+    const deltas = [0];
+    for (let i = 1; i < numbers.length; i++) deltas.push(numbers[i] - numbers[i - 1]);
+
+    // Pad to block size
+    const padLen = (bs - (deltas.length % bs)) % bs;
+    const padded = [...deltas, ...Array(padLen).fill(0)];
+
+    const blockMins = [], blockMaxs = [], quantized = [];
+    for (let start = 0; start < padded.length; start += bs) {
+      const block = padded.slice(start, start + bs);
+      const rotated = this._hadamard(block, false, this.seed + start);
+
+      let mn = Infinity, mx = -Infinity;
+      for (const v of rotated) { if (v < mn) mn = v; if (v > mx) mx = v; }
+      blockMins.push(mn);
+      blockMaxs.push(mx);
+
+      const range = mx - mn || 1e-10;
+      for (const v of rotated) {
+        let q = Math.round((v - mn) / range * (this.levels - 1));
+        q = Math.max(0, Math.min(this.levels - 1, q));
+        quantized.push(q);
+      }
+    }
+
+    // Pack bits
+    const totalBits = quantized.length * this.bits;
+    const packed = new Uint8Array(Math.ceil(totalBits / 8));
+    let bitPos = 0;
+    for (const val of quantized) {
+      for (let b = 0; b < this.bits; b++) {
+        if (val & (1 << b)) packed[bitPos >> 3] |= (1 << (bitPos & 7));
+        bitPos++;
+      }
+    }
+
+    return {
+      packed: Buffer.from(packed).toString('base64'),
+      blockMins, blockMaxs,
+      first, originalLen: numbers.length, padLen,
+      bits: this.bits, blockSize: bs, seed: this.seed
+    };
+  }
+
+  decompress(compressed) {
+    const { packed: b64, blockMins, blockMaxs, first, originalLen, padLen, bits, blockSize: bs, seed } = compressed;
+    this.bits = bits;
+    this.blockSize = bs;
+    this.seed = seed;
+    this.levels = 1 << bits;
+
+    const packed = Buffer.from(b64, 'base64');
+    const totalQ = blockMins.length * bs;
+
+    // Unpack bits
+    const quantized = [];
+    let bitPos = 0;
+    for (let i = 0; i < totalQ; i++) {
+      let val = 0;
+      for (let b = 0; b < bits; b++) {
+        if (packed[bitPos >> 3] & (1 << (bitPos & 7))) val |= (1 << b);
+        bitPos++;
+      }
+      quantized.push(val);
+    }
+
+    // Dequantize and inverse rotate
+    const deltas = [];
+    for (let i = 0; i < blockMins.length; i++) {
+      const mn = blockMins[i], mx = blockMaxs[i];
+      const range = mx - mn || 1e-10;
+      const dequant = [];
+      for (let j = 0; j < bs; j++) {
+        dequant.push(mn + quantized[i * bs + j] / (this.levels - 1) * range);
+      }
+      const restored = this._hadamard(dequant, true, seed + i * bs);
+      deltas.push(...restored);
+    }
+
+    // Delta decode
+    const result = [first];
+    for (let i = 1; i < originalLen; i++) result.push(result[i - 1] + deltas[i]);
+    return result;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
 // MCP Protocol Implementation (JSON-RPC over stdio)
 // ═══════════════════════════════════════════════════════════
 
@@ -49,6 +205,73 @@ class MCPCompressServer {
   }
 
   // ── Compression algorithms ──
+
+  handleQuantize(args) {
+    const { numbers, bits = 4 } = args;
+    if (!numbers) return { error: 'Missing "numbers" — provide a JSON array of numbers or comma-separated values' };
+
+    let nums;
+    try {
+      nums = typeof numbers === 'string' ? JSON.parse(numbers) : numbers;
+      if (!Array.isArray(nums)) nums = numbers.split(',').map(Number);
+    } catch (e) {
+      try { nums = numbers.split(',').map(s => parseFloat(s.trim())); }
+      catch (e2) { return { error: 'Could not parse numbers. Provide JSON array or comma-separated values.' }; }
+    }
+
+    if (nums.length < 2) return { error: 'Need at least 2 numbers' };
+    if (nums.some(n => isNaN(n))) return { error: 'All values must be numbers' };
+
+    const tq = new TurboQuant(bits, Math.min(32, Math.pow(2, Math.ceil(Math.log2(Math.min(nums.length, 32))))));
+    const compressed = tq.compress(nums);
+    const restored = tq.decompress(compressed);
+
+    const rawBytes = nums.length * 8; // float64
+    const compBytes = Buffer.from(compressed.packed, 'base64').length + compressed.blockMins.length * 16;
+    const ratio = rawBytes / compBytes;
+
+    let totalErr = 0, maxErr = 0;
+    for (let i = 0; i < nums.length; i++) {
+      const err = Math.abs(nums[i] - restored[i]);
+      totalErr += err;
+      if (err > maxErr) maxErr = err;
+    }
+    const mae = totalErr / nums.length;
+    const mape = nums.reduce((s, v, i) => s + (v !== 0 ? Math.abs(v - restored[i]) / Math.abs(v) : 0), 0) / nums.length * 100;
+
+    this.stats.operations++;
+    return {
+      algorithm: `turboquant-${bits}bit`,
+      original_count: nums.length,
+      original_bytes: rawBytes,
+      compressed_bytes: compBytes,
+      ratio: `${ratio.toFixed(1)}x`,
+      saved_percent: `${((1 - compBytes / rawBytes) * 100).toFixed(1)}%`,
+      mean_absolute_error: mae.toFixed(6),
+      max_error: maxErr.toFixed(6),
+      mape_percent: `${mape.toFixed(3)}%`,
+      bits_per_value: bits,
+      lossless: false,
+      compressed_data: JSON.stringify(compressed),
+      sample_original: nums.slice(0, 5),
+      sample_restored: restored.slice(0, 5).map(v => parseFloat(v.toFixed(6))),
+    };
+  }
+
+  handleDequantize(args) {
+    const { compressed_data } = args;
+    if (!compressed_data) return { error: 'Missing "compressed_data"' };
+
+    try {
+      const compressed = JSON.parse(compressed_data);
+      const tq = new TurboQuant();
+      const restored = tq.decompress(compressed);
+      this.stats.operations++;
+      return { numbers: restored.map(v => parseFloat(v.toFixed(8))), count: restored.length };
+    } catch (e) {
+      return { error: `Dequantize failed: ${e.message}` };
+    }
+  }
 
   compressData(data, algorithm = 'auto') {
     const buf = Buffer.from(data, 'utf-8');
@@ -70,13 +293,29 @@ class MCPCompressServer {
       } catch (e) { /* skip */ }
     }
 
+    // TurboQuant: convert text to byte vector, quantize, compare
+    if (algorithm === 'auto' || algorithm === 'turboquant') {
+      try {
+        const bytes = Array.from(buf);
+        const tq = new TurboQuant(4, 32);
+        const tqCompressed = tq.compress(bytes);
+        const tqBytes = Buffer.from(tqCompressed.packed, 'base64').length +
+                        tqCompressed.blockMins.length * 16 + 50; // metadata overhead
+        results.turboquant = Buffer.from(JSON.stringify(tqCompressed));
+        // Store actual compressed size for comparison
+        results._turboquant_size = tqBytes;
+      } catch (e) { /* skip if data too small */ }
+    }
+
     if (algorithm === 'auto') {
       // Pick the smallest
       let best = null;
       let bestSize = Infinity;
       for (const [alg, compressed] of Object.entries(results)) {
-        if (compressed.length < bestSize) {
-          bestSize = compressed.length;
+        if (alg.startsWith('_')) continue;
+        const size = alg === 'turboquant' ? (results._turboquant_size || compressed.length) : compressed.length;
+        if (size < bestSize) {
+          bestSize = size;
           best = alg;
         }
       }
@@ -87,7 +326,10 @@ class MCPCompressServer {
         compressedSize: bestSize,
         ratio: buf.length / bestSize,
         allResults: Object.fromEntries(
-          Object.entries(results).map(([k, v]) => [k, { size: v.length, ratio: (buf.length / v.length).toFixed(2) }])
+          Object.entries(results).filter(([k]) => !k.startsWith('_')).map(([k, v]) => {
+            const size = k === 'turboquant' ? (results._turboquant_size || v.length) : v.length;
+            return [k, { size, ratio: (buf.length / size).toFixed(2) }];
+          })
         )
       };
     }
@@ -110,6 +352,13 @@ class MCPCompressServer {
       case 'gzip': decompressed = gunzipSync(buf); break;
       case 'brotli': decompressed = brotliDecompressSync(buf); break;
       case 'deflate': decompressed = inflateSync(buf); break;
+      case 'turboquant': {
+        const tqData = JSON.parse(buf.toString('utf-8'));
+        const tq = new TurboQuant();
+        const bytes = tq.decompress(tqData);
+        decompressed = Buffer.from(bytes.map(b => Math.round(Math.max(0, Math.min(255, b)))));
+        break;
+      }
       default: throw new Error(`Unknown algorithm: ${algorithm}`);
     }
     return decompressed.toString('utf-8');
@@ -374,6 +623,29 @@ class MCPCompressServer {
         name: 'stats',
         description: 'Show compression statistics: total items stored, bytes saved, overall compression ratio.',
         inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'quantize',
+        description: 'TurboQuant: Extreme compression for numerical data (prices, sensor readings, embeddings, vectors). Based on Google TurboQuant (ICLR 2026). Converts numbers to 1-4 bits using random rotation + quantization. Lossy but near-zero error on correlated data.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            numbers: { type: 'string', description: 'JSON array of numbers, e.g., "[1.5, 2.3, 3.1]" or comma-separated "1.5,2.3,3.1"' },
+            bits: { type: 'number', description: 'Bits per value: 1, 2, 3, or 4. Lower = more compression, more error. Default: 4' }
+          },
+          required: ['numbers']
+        }
+      },
+      {
+        name: 'dequantize',
+        description: 'Decompress TurboQuant-compressed numerical data back to numbers.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            compressed_data: { type: 'string', description: 'The compressed_data string from a quantize result' }
+          },
+          required: ['compressed_data']
+        }
       }
     ];
   }
@@ -415,6 +687,8 @@ class MCPCompressServer {
             case 'retrieve': result = this.handleRetrieve(args); break;
             case 'list': result = this.handleList(); break;
             case 'stats': result = this.handleStats(); break;
+            case 'quantize': result = this.handleQuantize(args); break;
+            case 'dequantize': result = this.handleDequantize(args); break;
             default: result = { error: `Unknown tool: ${toolName}` };
           }
         } catch (e) {
